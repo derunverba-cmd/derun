@@ -9,13 +9,19 @@ if not TOKEN:
 
 ADMIN_ID = 7660211311
 CARD = os.environ.get("CARD", "4874 0700 6372 5947")
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
+SUPPORT = "@derunovich"
 
 MIN_TOPUP = 10                 # мінімум поповнення на карту, грн
 MIN_STARS = 1                  # мінімум поповнення зірками
 MIN_SELL = 10_000_000          # мінімум продажу, віртуальна валюта
 UAH_PER_MILLION = 3            # поповнення: 30грн = 10.000.000
 
-# Таблиця продажу (для показу користувачу)
+# Курси калькулятора
+CALC_UAH_PER_MILLION = 3       # 3 грн = 1.000.000 валюти
+CALC_STARS_PER_MILLION = 5     # 5 зірок = 1.000.000 валюти
+CALC_SELL_UAH_PER_MILLION = 1.5  # 1.000.000 валюти = 1.50 грн
+
 SELL_TABLE = [
     (1_000_000, 3),
     (5_000_000, 15),
@@ -27,7 +33,8 @@ SELL_TABLE = [
 bot = telebot.TeleBot(TOKEN)
 
 # ---------- База даних ----------
-db = sqlite3.connect("bot.db", check_same_thread=False)
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = db.cursor()
 
 cur.execute("""
@@ -38,7 +45,6 @@ CREATE TABLE IF NOT EXISTS users (
     total_topped_up REAL DEFAULT 0
 )
 """)
-# міграція зі старої бази
 cur.execute("PRAGMA table_info(users)")
 cols = [r[1] for r in cur.fetchall()]
 if "stars" not in cols:
@@ -51,7 +57,7 @@ CREATE TABLE IF NOT EXISTS topups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
     amount REAL,
-    status TEXT   -- waiting_receipt / pending / approved / rejected / cancelled
+    status TEXT
 )
 """)
 cur.execute("""
@@ -62,7 +68,7 @@ CREATE TABLE IF NOT EXISTS sells (
     payout REAL,
     cost REAL,
     requisites TEXT,
-    status TEXT   -- waiting_requisites / pending / done
+    status TEXT
 )
 """)
 db.commit()
@@ -91,7 +97,6 @@ def big(n):
 
 
 def sell_payout(virtual):
-    """Скільки грн отримає людина за продаж."""
     if virtual >= 100_000_000:
         rate = 2.8
     elif virtual >= 50_000_000:
@@ -102,22 +107,31 @@ def sell_payout(virtual):
 
 
 def sell_cost(virtual):
-    """Скільки грн знімається з профілю (30грн = 10.000.000)."""
     return round(virtual / 1_000_000 * UAH_PER_MILLION, 2)
 
 
 # ---------- Клавіатури ----------
 BTN_PROFILE = "✈️Профіль"
 BTN_WALLET = "💸 Гаманець"
+BTN_CALC = "🧮 Калькулятор"
+BTN_SETTINGS = "⚙️ Налаштування"
 BTN_TOPUP = "ПОПОВНИТИ"
 BTN_SELL = "ПРОДАТИ"
 BTN_BACK = "⬅️ Назад"
-ALL_BUTTONS = {BTN_PROFILE, BTN_WALLET, BTN_TOPUP, BTN_SELL, BTN_BACK}
+BTN_UAH_TO_CUR = "грн -> валюта"
+BTN_CUR_TO_UAH = "Валюта -> грн"
+BTN_STARS_TO_CUR = "Зірки -> валюта"
+ALL_BUTTONS = {
+    BTN_PROFILE, BTN_WALLET, BTN_CALC, BTN_SETTINGS,
+    BTN_TOPUP, BTN_SELL, BTN_BACK,
+    BTN_UAH_TO_CUR, BTN_CUR_TO_UAH, BTN_STARS_TO_CUR,
+}
 
 
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(BTN_PROFILE, BTN_WALLET)
+    kb.add(BTN_CALC, BTN_SETTINGS)
     return kb
 
 
@@ -128,8 +142,16 @@ def wallet_menu():
     return kb
 
 
+def calc_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(BTN_UAH_TO_CUR, BTN_CUR_TO_UAH)
+    kb.add(BTN_STARS_TO_CUR)
+    kb.add(BTN_BACK)
+    return kb
+
+
 def cancel_if_menu(message):
-    """Якщо людина натиснула кнопку меню замість введення - скасовуємо."""
+    """Якщо натиснули кнопку меню замість введення - скасовуємо."""
     if message.text in ALL_BUTTONS:
         bot.send_message(message.chat.id, "Скасовано.", reply_markup=main_menu())
         return True
@@ -151,6 +173,28 @@ def back(message):
     bot.send_message(message.chat.id, "Головне меню 👇", reply_markup=main_menu())
 
 
+# ---------- Адмін: ручне нарахування ----------
+@bot.message_handler(commands=["add"])
+def admin_add(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    try:
+        user_id = int(parts[1])
+        amount = float(parts[2].replace(",", "."))
+    except (IndexError, ValueError):
+        bot.send_message(message.chat.id, "Формат: /add айді_користувача сума")
+        return
+    get_user(user_id)
+    cur.execute(
+        "UPDATE users SET money = money + ?, total_topped_up = total_topped_up + ? "
+        "WHERE user_id = ?",
+        (amount, amount, user_id),
+    )
+    db.commit()
+    bot.send_message(message.chat.id, f"Додано {fmt(amount)}₴ користувачу {user_id}")
+
+
 # ---------- Профіль ----------
 @bot.message_handler(func=lambda m: m.text == BTN_PROFILE)
 def profile(message):
@@ -161,17 +205,100 @@ def profile(message):
     )
 
 
+# ---------- Налаштування ----------
+@bot.message_handler(func=lambda m: m.text == BTN_SETTINGS)
+def settings(message):
+    bot.send_message(message.chat.id, f"Підтримка: {SUPPORT}")
+
+
 # ---------- Гаманець ----------
 @bot.message_handler(func=lambda m: m.text == BTN_WALLET)
 def wallet(message):
-    money, stars, total = get_user(message.from_user.id)
+    money, stars, _ = get_user(message.from_user.id)
+    game = int(money / UAH_PER_MILLION * 1_000_000)  # 30грн = 10.000.000
     bot.send_message(
         message.chat.id,
-        f"Зірки: {stars}\n"
-        f"Гривні: {fmt(money)}\n\n"
-        f"Поповнено за весь час: {fmt(total)}₴",
+        f"Гроші: {fmt(money)}₴\n\n"
+        f"Зірки: {stars}\n\n"
+        f"Ігрова валюта: {big(game)}",
         reply_markup=wallet_menu(),
     )
+
+
+# ---------- Калькулятор ----------
+@bot.message_handler(func=lambda m: m.text == BTN_CALC)
+def calc(message):
+    bot.send_message(
+        message.chat.id,
+        "Калькулятор - за допомогою якого ви дізнаєтеся курс валюти",
+        reply_markup=calc_menu(),
+    )
+
+
+def parse_decimal(text):
+    try:
+        return float((text or "").replace(",", ".").replace(" ", ""))
+    except ValueError:
+        return None
+
+
+def parse_int(text):
+    t = (text or "").replace(".", "").replace(",", "").replace(" ", "")
+    return int(t) if t.isdigit() else None
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_UAH_TO_CUR)
+def calc_uah(message):
+    msg = bot.send_message(message.chat.id, "Введіть суму в грн:")
+    bot.register_next_step_handler(msg, calc_uah_result)
+
+
+def calc_uah_result(message):
+    if cancel_if_menu(message):
+        return
+    amount = parse_decimal(message.text)
+    if amount is None or amount <= 0:
+        msg = bot.send_message(message.chat.id, "Введіть число, наприклад 30")
+        bot.register_next_step_handler(msg, calc_uah_result)
+        return
+    result = int(amount / CALC_UAH_PER_MILLION * 1_000_000)
+    bot.send_message(message.chat.id, f"{fmt(amount)}грн = {big(result)} валюти")
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_CUR_TO_UAH)
+def calc_cur(message):
+    msg = bot.send_message(message.chat.id, "Введіть кількість валюти:")
+    bot.register_next_step_handler(msg, calc_cur_result)
+
+
+def calc_cur_result(message):
+    if cancel_if_menu(message):
+        return
+    amount = parse_int(message.text)
+    if amount is None or amount <= 0:
+        msg = bot.send_message(message.chat.id, "Введіть число, наприклад 1000000")
+        bot.register_next_step_handler(msg, calc_cur_result)
+        return
+    result = amount / 1_000_000 * CALC_SELL_UAH_PER_MILLION
+    bot.send_message(message.chat.id, f"{big(amount)} валюти = {fmt(round(result, 2))}грн")
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_STARS_TO_CUR)
+def calc_stars(message):
+    msg = bot.send_message(message.chat.id, "Введіть кількість зірок:")
+    bot.register_next_step_handler(msg, calc_stars_result)
+
+
+def calc_stars_result(message):
+    if cancel_if_menu(message):
+        return
+    amount = parse_decimal(message.text)
+    if amount is None or amount <= 0:
+        msg = bot.send_message(message.chat.id, "Введіть число, наприклад 5")
+        bot.register_next_step_handler(msg, calc_stars_result)
+        return
+    result = int(amount / CALC_STARS_PER_MILLION * 1_000_000)
+    bot.send_message(message.chat.id, f"{fmt(amount)}⭐️ = {big(result)} валюти")
 
 
 # ---------- ПОПОВНИТИ ----------
@@ -185,7 +312,6 @@ def topup(message):
     bot.send_message(message.chat.id, "Поповнення\n\nОберіть спосіб:", reply_markup=kb)
 
 
-# --- на карту ---
 @bot.callback_query_handler(func=lambda c: c.data == "topup_card")
 def topup_card(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -200,12 +326,7 @@ def topup_card(call):
 def get_card_amount(message):
     if cancel_if_menu(message):
         return
-    text = (message.text or "").replace(",", ".").strip()
-    try:
-        amount = float(text)
-    except ValueError:
-        amount = None
-
+    amount = parse_decimal(message.text)
     if amount is None or amount < MIN_TOPUP:
         msg = bot.send_message(message.chat.id, f"Введіть число. Мінімум {MIN_TOPUP}₴")
         bot.register_next_step_handler(msg, get_card_amount)
@@ -232,7 +353,6 @@ def get_card_amount(message):
     )
 
 
-# --- зірками (Telegram Stars) ---
 @bot.callback_query_handler(func=lambda c: c.data == "topup_stars")
 def topup_stars(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -259,7 +379,7 @@ def get_stars_amount(message):
         title="Поповнення зірками",
         description=f"Поповнення гаманця на {stars}⭐️",
         invoice_payload=f"stars_{stars}",
-        provider_token="",          # для Telegram Stars токен порожній
+        provider_token="",
         currency="XTR",
         prices=[types.LabeledPrice(label="Зірки", amount=stars)],
     )
@@ -284,7 +404,6 @@ def paid(message):
     )
 
 
-# --- квитанція -> адміну ---
 @bot.message_handler(content_types=["photo", "document"])
 def receipt(message):
     user_id = message.from_user.id
@@ -381,16 +500,12 @@ def sell(message):
 def get_sell_amount(message):
     if cancel_if_menu(message):
         return
-    text = (message.text or "").replace(".", "").replace(",", "").replace(" ", "")
-    if not text.isdigit() or int(text) < MIN_SELL:
-        msg = bot.send_message(
-            message.chat.id,
-            f"Введіть число. Мінімум {big(MIN_SELL)}",
-        )
+    virtual = parse_int(message.text)
+    if virtual is None or virtual < MIN_SELL:
+        msg = bot.send_message(message.chat.id, f"Введіть число. Мінімум {big(MIN_SELL)}")
         bot.register_next_step_handler(msg, get_sell_amount)
         return
 
-    virtual = int(text)
     payout = sell_payout(virtual)
     cost = sell_cost(virtual)
 
@@ -473,7 +588,6 @@ def sell_sent(call):
         )
         return
 
-    # знімаємо з профілю
     cur.execute("UPDATE users SET money = money - ? WHERE user_id = ?", (cost, user_id))
     cur.execute("UPDATE sells SET status = 'done' WHERE id = ?", (sell_id,))
     db.commit()
